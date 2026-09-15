@@ -60,6 +60,8 @@
   .board-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; }
   .board { display: grid; grid-template-columns: 22px repeat(10, 1fr); grid-template-rows: 22px repeat(10, 1fr); gap: 2px; width: min(92vw, 400px); aspect-ratio: 1; padding: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; transition: box-shadow .15s, border-color .15s; }
   .board.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(124,140,255,.25); }
+  .board.placing { touch-action: none; user-select: none; -webkit-user-select: none; }
+  .board.placing .cell { cursor: grab; }
   .board .lbl { display: flex; align-items: center; justify-content: center; font-size: .7rem; color: var(--muted); }
   .cell { position: relative; border: 0; padding: 0; margin: 0; border-radius: 3px; background: var(--sea); color: var(--text); font-size: .9rem; display: flex; align-items: center; justify-content: center; transition: background .1s; }
   .cell:disabled { cursor: default; filter: none; }
@@ -148,10 +150,12 @@
     <div class="fleet" id="fleet"></div>
     <div class="row center">
       <button id="rotate-btn" class="secondary small">Rotate (R)</button>
+      <button id="place-btn" class="small" disabled>Place ship</button>
       <button id="random-btn" class="secondary small">Random</button>
       <button id="clear-btn" class="secondary small">Clear</button>
       <button id="ready-btn" class="small" disabled>Ready</button>
     </div>
+    <p id="place-hint" class="small-text" style="margin:0;text-align:center"></p>
   </div>
 
   <div class="boards">
@@ -266,7 +270,8 @@ let myShips = [], theirSunk = [];              // theirSunk: [{name, cells}]
 let shotsOnMe = emptyGrid(), myShots = emptyGrid();   // ''|'H'|'M'
 let myTurn = false, myReady = false, theirReady = false;
 let lastShotMe = null, lastShotThem = null;
-let horiz = true, currentDef = 0, previewCells = null;
+let preview = null;                            // ghost ship being positioned: {def, r, c, horiz}
+let drag = null;                               // {grabIdx} while a finger/mouse is dragging the ghost
 let revealedShips = null;
 
 /* ---------- screens ---------- */
@@ -476,8 +481,9 @@ function startGame(f) {
   shotsOnMe = emptyGrid(); myShots = emptyGrid();
   myReady = theirReady = false; myTurn = false;
   lastShotMe = lastShotThem = null;
-  horiz = true; currentDef = 0; previewCells = null;
+  preview = null; drag = null;
   phase = 'place';
+  nextPreview(4, 3, true);
   hideOverlays();
   buildBoards();
   $('name-me').textContent = myName;
@@ -493,49 +499,104 @@ function maybeStartBattle() {
   phase = 'battle';
   myTurn = (first === role);
   $('place-tools').hidden = true;
-  previewCells = null;
+  preview = null; drag = null;
   $('log').textContent = myTurn ? 'You fire first.' : theirName + ' fires first.';
   renderAll();
 }
 
-/* ---------- placement ---------- */
+/* ---------- placement ----------
+   The current ship is a "ghost" on your board. Drag it with a finger or the
+   mouse (or tap a cell to jump it there), rotate, then press "Place ship".
+   Tapping or dragging one of your placed ships picks it back up.            */
 function placedShip(name) { return myShips.find(s => s.name === name); }
-function nextUnplaced() { const i = FLEET.findIndex(d => !placedShip(d.name)); return i; }
-function tryPlaceAt(r, c) {
-  const def = FLEET[currentDef]; if (!def) return;
-  // clicking one of my own ships removes it (to re-place it)
-  const hitShip = myShips.find(s => s.cells.some(([sr, sc]) => sr === r && sc === c));
-  if (hitShip) { myShips = myShips.filter(s => s !== hitShip); currentDef = FLEET.findIndex(d => d.name === hitShip.name); renderAll(); return; }
-  if (placedShip(def.name)) return;
-  // anchor so the ship stays on the board when clicking near an edge
-  let rr = r, cc = c;
-  if (horiz) cc = Math.min(cc, SIZE - def.len); else rr = Math.min(rr, SIZE - def.len);
-  if (!canPlace(myShips, rr, cc, def.len, horiz)) { flashBad(r, c); return; }
-  myShips.push(makeShip(def, rr, cc, horiz));
-  const n = nextUnplaced(); currentDef = n === -1 ? currentDef : n;
-  previewCells = null;
+function clampAnchor(p) {
+  if (p.horiz) { p.c = Math.max(0, Math.min(p.c, SIZE - p.def.len)); p.r = Math.max(0, Math.min(p.r, SIZE - 1)); }
+  else { p.r = Math.max(0, Math.min(p.r, SIZE - p.def.len)); p.c = Math.max(0, Math.min(p.c, SIZE - 1)); }
+  return p;
+}
+function previewCells() { return preview ? shipCells(preview.r, preview.c, preview.def.len, preview.horiz) : []; }
+function previewOk() { return !!preview && canPlace(myShips, preview.r, preview.c, preview.def.len, preview.horiz); }
+// Start positioning the next unplaced ship near (r,c); null when the fleet is complete.
+function nextPreview(r, c, horiz) {
+  const def = FLEET.find(d => !placedShip(d.name));
+  if (!def) { preview = null; return; }
+  preview = clampAnchor({ def, r, c, horiz });
+  if (previewOk()) return;
+  // Don't drop the new ghost on top of a placed ship: find the nearest free spot.
+  let best = null, bestDist = Infinity;
+  for (const h of [horiz, !horiz]) for (let rr = 0; rr < SIZE; rr++) for (let cc = 0; cc < SIZE; cc++) {
+    if (!canPlace(myShips, rr, cc, def.len, h)) continue;
+    const d = Math.abs(rr - r) + Math.abs(cc - c) + (h === horiz ? 0 : 0.5);
+    if (d < bestDist) { bestDist = d; best = { def, r: rr, c: cc, horiz: h }; }
+  }
+  if (best) preview = best;
+}
+function cellAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const cell = el && el.closest ? el.closest('#board-me .cell') : null;
+  return cell ? [Number(cell.dataset.r), Number(cell.dataset.c)] : null;
+}
+function moveGhostTo(r, c, grabIdx) {
+  if (!preview) return;
+  if (preview.horiz) { preview.r = r; preview.c = c - grabIdx; } else { preview.r = r - grabIdx; preview.c = c; }
+  clampAnchor(preview);
+}
+function onBoardPointerDown(e) {
+  if (phase !== 'place' || myReady) return;
+  const hit = cellAt(e.clientX, e.clientY); if (!hit) return;
+  const [r, c] = hit;
+  e.preventDefault();
+  const idxIn = cells => cells.findIndex(([cr, cc]) => cr === r && cc === c);
+  let grabIdx = preview ? idxIn(previewCells()) : -1;
+  if (grabIdx === -1) {
+    // Not on the ghost: pick up a placed ship under the finger, or jump the ghost here.
+    const ship = myShips.find(s => idxIn(s.cells) !== -1);
+    if (ship) {
+      myShips = myShips.filter(s => s !== ship);
+      preview = { def: FLEET.find(d => d.name === ship.name), r: ship.r, c: ship.c, horiz: ship.horiz };
+      grabIdx = idxIn(ship.cells);
+    } else if (preview) {
+      grabIdx = Math.floor((preview.def.len - 1) / 2);
+      moveGhostTo(r, c, grabIdx);
+    } else return;
+  }
+  drag = { grabIdx, pointerId: e.pointerId };
+  try { $('board-me').setPointerCapture(e.pointerId); } catch {}
   renderAll();
 }
-function flashBad(r, c) {
-  const cell = cellEl('me', r, c); cell.classList.add('preview', 'bad');
-  setTimeout(() => cell.classList.remove('preview', 'bad'), 250);
+function onBoardPointerMove(e) {
+  if (!drag || !preview || e.pointerId !== drag.pointerId) return;
+  const hit = cellAt(e.clientX, e.clientY); if (!hit) return;
+  const before = preview.r + ',' + preview.c;
+  moveGhostTo(hit[0], hit[1], drag.grabIdx);
+  if (before !== preview.r + ',' + preview.c) renderBoards();
 }
-function setPreview(r, c) {
-  const def = FLEET[currentDef];
-  if (phase !== 'place' || !def || placedShip(def.name)) { previewCells = null; renderBoards(); return; }
-  let rr = r, cc = c;
-  if (horiz) cc = Math.min(cc, SIZE - def.len); else rr = Math.min(rr, SIZE - def.len);
-  const cells = shipCells(rr, cc, def.len, horiz);
-  previewCells = { cells, ok: canPlace(myShips, rr, cc, def.len, horiz) };
-  renderBoards();
+function onBoardPointerUp(e) {
+  if (!drag || e.pointerId !== drag.pointerId) return;
+  drag = null;
+  try { $('board-me').releasePointerCapture(e.pointerId); } catch {}
+  renderHeader();
 }
-$('rotate-btn').onclick = () => { horiz = !horiz; renderBoards(); };
-document.addEventListener('keydown', e => { if (phase === 'place' && (e.key === 'r' || e.key === 'R')) { horiz = !horiz; renderBoards(); } });
-$('random-btn').onclick = () => { if (phase !== 'place' || myReady) return; myShips = randomFleet(); currentDef = 0; previewCells = null; renderAll(); };
-$('clear-btn').onclick = () => { if (phase !== 'place' || myReady) return; myShips = []; currentDef = 0; renderAll(); };
+function rotateGhost() { if (preview && !myReady) { preview.horiz = !preview.horiz; clampAnchor(preview); renderAll(); } }
+$('rotate-btn').onclick = rotateGhost;
+document.addEventListener('keydown', e => {
+  if (phase !== 'place' || myReady) return;
+  if (e.key === 'r' || e.key === 'R') rotateGhost();
+  if (e.key === 'Enter' || e.key === ' ') { if (document.activeElement === document.body) { e.preventDefault(); placeGhost(); } }
+});
+function placeGhost() {
+  if (phase !== 'place' || myReady || !previewOk()) return;
+  const p = preview;
+  myShips.push(makeShip(p.def, p.r, p.c, p.horiz));
+  nextPreview(p.r, p.c, p.horiz);
+  renderAll();
+}
+$('place-btn').onclick = placeGhost;
+$('random-btn').onclick = () => { if (phase !== 'place' || myReady) return; myShips = randomFleet(); preview = null; renderAll(); };
+$('clear-btn').onclick = () => { if (phase !== 'place' || myReady) return; myShips = []; nextPreview(4, 3, true); renderAll(); };
 $('ready-btn').onclick = () => {
   if (phase !== 'place' || myShips.length !== FLEET.length || myReady) return;
-  myReady = true; previewCells = null;
+  myReady = true; preview = null; drag = null;
   send({ type: 'ready' });
   renderAll();
   maybeStartBattle();
@@ -609,17 +670,15 @@ function buildBoards() {
         const cell = document.createElement('button');
         cell.className = 'cell'; cell.dataset.r = r; cell.dataset.c = c;
         cell.setAttribute('aria-label', (side === 'me' ? 'Your ' : 'Enemy ') + coordName(r, c));
-        if (side === 'me') {
-          cell.onclick = () => { if (phase === 'place' && !myReady) tryPlaceAt(r, c); };
-          cell.onmouseenter = () => { if (phase === 'place' && !myReady) setPreview(r, c); };
-        } else {
-          cell.onclick = () => fireAt(r, c);
-        }
+        if (side === 'them') cell.onclick = () => fireAt(r, c);
         b.appendChild(cell);
       }
     }
   }
-  $('board-me').onmouseleave = () => { if (previewCells) { previewCells = null; renderBoards(); } };
+  const me = $('board-me');
+  me.onpointerdown = onBoardPointerDown;
+  me.onpointermove = onBoardPointerMove;
+  me.onpointerup = me.onpointercancel = onBoardPointerUp;
   function lbl(t) { const d = document.createElement('div'); d.className = 'lbl'; d.textContent = t; return d; }
 }
 function cellEl(side, r, c) { return $('board-' + side).children[1 + SIZE + 1 + r * (SIZE + 1) + c]; }
@@ -635,6 +694,12 @@ function renderHeader() {
   if (phase === 'place') {
     if (myReady) st.textContent = theirReady ? 'Starting…' : 'Waiting for ' + theirName + ' to place their ships…';
     else { const left = FLEET.length - myShips.length; st.textContent = left ? 'Place your ships — ' + left + ' to go' : 'All ships placed. Press Ready!'; }
+    const hint = $('place-hint');
+    if (myReady) hint.textContent = '';
+    else if (preview) hint.textContent = 'Drag the ' + preview.def.name + ' (or tap a square) to position it, rotate if needed, then press Place ship.' + (previewOk() ? '' : ' It overlaps another ship.');
+    else hint.textContent = 'Tap a ship to pick it up and move it, or press Ready.';
+    $('place-btn').disabled = myReady || !previewOk();
+    $('place-btn').textContent = preview ? 'Place ' + preview.def.name : 'Place ship';
   } else if (phase === 'battle') {
     if (myTurn) { st.textContent = 'Your turn — pick a target in enemy waters'; st.className = 'status mine'; }
     else st.textContent = theirName + "'s turn…";
@@ -644,11 +709,18 @@ function renderHeader() {
 }
 function renderFleetBar() {
   const bar = $('fleet'); bar.innerHTML = '';
-  FLEET.forEach((d, i) => {
+  FLEET.forEach(d => {
     const b = document.createElement('button');
-    b.className = 'secondary small' + (placedShip(d.name) ? ' placed' : '') + (i === currentDef && !placedShip(d.name) ? ' current' : '');
+    const isCurrent = preview && preview.def.name === d.name;
+    b.className = 'secondary small' + (placedShip(d.name) ? ' placed' : '') + (isCurrent ? ' current' : '');
     b.innerHTML = '<span>' + d.name + '</span><span class="pips">' + '<i></i>'.repeat(d.len) + '</span>';
-    b.onclick = () => { if (myReady) return; if (placedShip(d.name)) { myShips = myShips.filter(s => s.name !== d.name); } currentDef = i; renderAll(); };
+    b.onclick = () => {
+      if (myReady || phase !== 'place') return;
+      const ship = placedShip(d.name);
+      if (ship) { myShips = myShips.filter(s => s !== ship); preview = { def: d, r: ship.r, c: ship.c, horiz: ship.horiz }; }
+      else { const p = preview || { r: 4, c: 3, horiz: true }; preview = clampAnchor({ def: d, r: p.r, c: p.c, horiz: p.horiz }); }
+      renderAll();
+    };
     bar.appendChild(b);
   });
 }
@@ -656,6 +728,8 @@ function renderBoards() {
   // my board: ships, shots received
   const myActive = phase === 'place' && !myReady;
   $('board-me').classList.toggle('active', myActive);
+  $('board-me').classList.toggle('placing', myActive);
+  const ghost = previewCells(), ghostOk = previewOk();
   for (let r = 0; r < SIZE; r++) for (let c = 0; c < SIZE; c++) {
     const cell = cellEl('me', r, c);
     const ship = myShips.find(s => s.cells.some(([sr, sc]) => sr === r && sc === c));
@@ -663,7 +737,7 @@ function renderBoards() {
     if (ship) cls += ' ship';
     if (shotsOnMe[r][c] === 'H') cls += ship && ship.hits >= ship.len ? ' sunk' : ' hit';
     if (shotsOnMe[r][c] === 'M') cls += ' miss';
-    if (previewCells && previewCells.cells.some(([pr, pc]) => pr === r && pc === c)) cls += ' preview' + (previewCells.ok ? '' : ' bad');
+    if (ghost.some(([pr, pc]) => pr === r && pc === c)) cls += ' preview' + (ghostOk ? '' : ' bad');
     if (lastShotThem && lastShotThem[0] === r && lastShotThem[1] === c) cls += ' last';
     cell.className = cls;
     cell.disabled = !myActive;

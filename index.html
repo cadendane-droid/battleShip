@@ -203,6 +203,38 @@ const MENU_URL = '../Menu/';
 const ROOM_PREFIX = 'gameforall-bship-room-';   // separate namespace from the other games
 const NAME_KEY = 'gameforall.playerName';
 
+/* ---------- ICE / relay configuration (shared idea across all GameForAll games) ----------
+   Direct browser-to-browser links need a STUN server (free, below) and, on stricter
+   networks (mobile data, campus/office Wi-Fi, some home routers), a TURN relay.
+   The free public relays are dead, so paste your own from a free plan:
+     - metered.ca "Open Relay": sign up, then set TURN_CREDENTIALS_URL to
+       'https://<your-app>.metered.live/api/v1/turn/credentials?apiKey=<key>'
+     - or any provider that gives static credentials: put them in EXTRA_ICE_SERVERS, e.g.
+       [{ urls: 'turn:relay.example.com:3478', username: 'user', credential: 'pass' }]      */
+const TURN_CREDENTIALS_URL = '';
+const EXTRA_ICE_SERVERS = [];
+let iceConfigPromise = null, joinToken = 0;
+function getPeerOptions() {
+  if (!iceConfigPromise) iceConfigPromise = (async () => {
+    let servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }].concat(EXTRA_ICE_SERVERS);
+    if (TURN_CREDENTIALS_URL) {
+      try { const r = await fetch(TURN_CREDENTIALS_URL); if (r.ok) servers = (await r.json()).concat(EXTRA_ICE_SERVERS); else console.warn('TURN credentials request failed', r.status); }
+      catch (e) { console.warn('TURN credentials fetch failed', e); }
+    }
+    return { debug: 1, config: { iceServers: servers } };
+  })();
+  return iceConfigPromise;
+}
+function linkDiagnosis(c) {
+  let ice = 'none', answered = false;
+  try { const pc = c && c.peerConnection; if (pc) { ice = pc.iceConnectionState; answered = !!pc.remoteDescription; } } catch {}
+  return { ice, answered };
+}
+function natMessage(d) {
+  return 'The other player was found and the two browsers exchanged connection details, but no direct route between your networks could be opened (WebRTC ' + d.ice + '). ' +
+         'This happens on mobile data, campus/office Wi-Fi and some home routers. Fixes: put both devices on the same home Wi-Fi, or add a free TURN relay (see the README).';
+}
+
 /* =========================================================================
    RULES ENGINE (pure, no DOM)
    ========================================================================= */
@@ -309,7 +341,7 @@ $('end-menu').onclick = $('left-menu').onclick = () => { teardown(); location.hr
 /* =========================================================================
    NETWORKING (PeerJS) — same scheme as the other GameForAll games
    ========================================================================= */
-const CONNECT_TIMEOUT_MS = 12000;
+const CONNECT_TIMEOUT_MS = 15000;
 const MAX_ATTEMPTS = 3;
 let connectTimer = null, diagTimer = null, waitStarted = 0, stage = '';
 
@@ -331,10 +363,11 @@ function renderDiag() {
 }
 function lobbyError(msg) { teardown(); enterLobby(); $('lobby-error').textContent = msg; $('lobby-error').hidden = false; }
 
-function tryHost() {
+async function tryHost() {
   destroyPeer();
   setStage('Asking the broker for Room ' + room);
-  peer = new Peer(ROOM_PREFIX + room, { debug: 1 });
+  const token = ++joinToken, opts = await getPeerOptions(); if (token !== joinToken) return;
+  peer = new Peer(ROOM_PREFIX + room, opts);
   peer.on('open', () => {
     role = 'host';
     setWait('Waiting for your opponent…', 'Tell them to pick Room ' + room + ' and press Play.');
@@ -351,10 +384,11 @@ function tryHost() {
   });
   peer.on('disconnected', () => { if (peer && !peer.destroyed) peer.reconnect(); });
 }
-function tryGuest() {
+async function tryGuest() {
   destroyPeer();
   setStage('Room ' + room + ' has a host, joining as guest');
-  peer = new Peer({ debug: 1 });
+  const token = ++joinToken, opts = await getPeerOptions(); if (token !== joinToken) return;
+  peer = new Peer(opts);
   peer.on('open', () => {
     role = 'guest';
     setWait('Joining Room ' + room + '…', 'Found a host, connecting to them directly.');
@@ -386,8 +420,13 @@ function setupConn(c) {
   clearTimeout(connectTimer);
   connectTimer = setTimeout(() => {
     if (conn !== c || c.open) return;
-    if (role === 'guest') retryAfterStale('No answer from the host after ' + (CONNECT_TIMEOUT_MS / 1000) + 's');
-    else { try { c.close(); } catch {} conn = null; setStage('A connection attempt failed, still hosting'); }
+    const d = linkDiagnosis(c);
+    if (role === 'guest') { if (d.answered) lobbyError(natMessage(d)); else retryAfterStale('No answer from the host after ' + (CONNECT_TIMEOUT_MS / 1000) + 's'); }
+    else {
+      try { c.close(); } catch {} conn = null;
+      if (d.answered) { setWait('Waiting for your opponent…', natMessage(d)); setStage('Direct link failed (WebRTC ' + d.ice + '), still hosting'); }
+      else setStage('A connection attempt failed, still hosting');
+    }
   }, CONNECT_TIMEOUT_MS);
   c.on('open', () => {
     clearTimeout(connectTimer);
@@ -466,7 +505,7 @@ function destroyPeer() {
   if (peer) { try { peer.destroy(); } catch {} peer = null; }
   role = null;
 }
-function teardown() { destroyPeer(); clearInterval(diagTimer); phase = 'idle'; hideOverlays(); }
+function teardown() { joinToken++; destroyPeer(); clearInterval(diagTimer); phase = 'idle'; hideOverlays(); }
 $('wait-cancel').onclick = () => { teardown(); enterLobby(); };
 $('leave-btn').onclick = () => { teardown(); enterLobby(); };
 $('left-lobby').onclick = () => { teardown(); enterLobby(); };
